@@ -13,8 +13,8 @@ const char *password = "12345678";
 WebServer server(80);
 
 // Hardware Connections for ESP32-S3 SuperMini
-#define CAN_RX_PIN GPIO_NUM_5
-#define CAN_TX_PIN GPIO_NUM_4
+#define CAN_RX_PIN GPIO_NUM_4
+#define CAN_TX_PIN GPIO_NUM_5
 #define NUM_LEDS 1
 #define DATA_PIN 48
 CRGB leds[NUM_LEDS];
