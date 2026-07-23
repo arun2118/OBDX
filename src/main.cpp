@@ -37,6 +37,15 @@ volatile uint32_t lastCanFrameCount = 0;
 TaskHandle_t CanTaskHandle = NULL;
 TaskHandle_t RgbTaskHandle = NULL;
 
+// --- Filter on msg change ---
+struct IDTracker {
+    uint32_t id;
+    uint8_t lastData[8];
+};
+IDTracker trackList[100]; // Track up to 100 unique CAN IDs
+int trackCount = 0;
+
+
 // Forward Declarations
 void canSnifferTask(void *pvParameters);
 void rgbStatusTask(void *pvParameters);
@@ -173,33 +182,64 @@ void canSnifferTask(void *pvParameters) {
     char tempFrame[80];
     
     for (;;) {
-        if (twai_receive(&message, pdMS_TO_TICKS(5)) == ESP_OK) {
-            canFrameCount++; // Tells RGB status thread that data is streaming
-            
+        // Tighten timeout to 2ms for responsiveness
+        if (twai_receive(&message, pdMS_TO_TICKS(2)) == ESP_OK) {
+            canFrameCount++; 
             lastRawId = message.identifier;
-            sprintf(lastRawData, "%02X %02X %02X %02X %02X %02X %02X %02X", 
-                    message.data[0], message.data[1], message.data[2], message.data[3], 
-                    message.data[4], message.data[5], message.data[6], message.data[7]);
 
-            // Formulate standard string log frame entry
-            sprintf(tempFrame, "[ID: 0x%X] %s\n", message.identifier, lastRawData);
-            liveTerminalBuffer += tempFrame;
-            
-            // Manage dynamic RAM buffer string limits to keep memory utilization clean
-            if (liveTerminalBuffer.length() > 4000) {
-                liveTerminalBuffer = liveTerminalBuffer.substring(1500);
-            }
+            // --- FILTER LOGIC START ---
+            bool isNewOrChanged = true;
+            int foundIndex = -1;
 
-            // Write active frames straight to Flash memory via LittleFS if the recording mode button is toggled ON
-            if (flashRecordActive) {
-                File logFile = LittleFS.open(logFilePath, FILE_APPEND);
-                if (logFile) {
-                    logFile.print(tempFrame);
-                    logFile.close();
+            // Check if we have seen this CAN ID before
+            for (int i = 0; i < trackCount; i++) {
+                if (trackList[i].id == message.identifier) {
+                    foundIndex = i;
+                    // If seen, check if the 8 data bytes match the last time
+                    if (memcmp(trackList[i].lastData, message.data, 8) == 0) {
+                        isNewOrChanged = false; // Bytes match perfectly -> Silence it!
+                    }
+                    break;
                 }
             }
 
-            // Reverse Engineered payload dictionary mapping signatures
+            // If the data changed or it's a completely new ID, process it
+            if (isNewOrChanged) {
+                if (foundIndex != -1) {
+                    // Update existing ID tracker with the new bytes
+                    memcpy(trackList[foundIndex].lastData, message.data, 8);
+                } else if (trackCount < 100) {
+                    // Store new ID into our tracking array
+                    trackList[trackCount].id = message.identifier;
+                    memcpy(trackList[trackCount].lastData, message.data, 8);
+                    trackCount++;
+                }
+
+                // Format the hex string ONLY for changed data
+                sprintf(lastRawData, "%02X %02X %02X %02X %02X %02X %02X %02X", 
+                        message.data[0], message.data[1], message.data[2], message.data[3], 
+                        message.data[4], message.data[5], message.data[6], message.data[7]);
+
+                sprintf(tempFrame, "[ID: 0x%X] %s\n", message.identifier, lastRawData);
+                
+                // Append to web dashboard terminal console
+                liveTerminalBuffer += tempFrame;
+                if (liveTerminalBuffer.length() > 4000) {
+                    liveTerminalBuffer = liveTerminalBuffer.substring(1500);
+                }
+
+                // Write directly to file log only when values shift
+                if (flashRecordActive) {
+                    File logFile = LittleFS.open(logFilePath, FILE_APPEND);
+                    if (logFile) {
+                        logFile.print(tempFrame);
+                        logFile.close();
+                    }
+                }
+            }
+            // --- FILTER LOGIC END ---
+
+            // Keep your reverse engineered payload mappings running regardless of filter
             if (message.identifier == 0x201) { ignitionOn = (message.data[0] & 0x01); }
             if (message.identifier == 0x1F1) { inPark     = (message.data[0] == 0x18); }
             if (message.identifier == 0x216) { doorOpen   = (message.data[0] & 0x40); }
@@ -207,6 +247,7 @@ void canSnifferTask(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
+
 
 // Background Task for LED Animations (Core 1)
 void rgbStatusTask(void *pvParameters) {
