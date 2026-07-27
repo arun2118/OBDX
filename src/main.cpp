@@ -7,23 +7,23 @@
 #include <driver/twai.h>
 #include <FastLED.h>
 
-// Wi-Fi Access Point Credentials Configuration
+// Wi-Fi Access Point Configuration Credentials
 const char *ssid = "TruckOBDscan";
 const char *password = "12345678";
 
-// Active Networking Server Declarations
-WebServer server(80);       // Main HTTP Port for Dash View
-WiFiServer savvyServer(23); // Native Raw TCP socket for SavvyCAN Protocol Linking
-WiFiClient savvyClient;     // Network streaming target reference container
+// Wireless Socket Server Instantiations
+WebServer server(80);       // Port 80 for Custom HTML Web Dashboard 
+WiFiServer savvyServer(23); // Port 23 RAW TCP Socket for Streaming to SavvyCAN
+WiFiClient savvyClient;     // Active network reference client container
 
-// Hardware Layer Connections - ESP32-S3 SuperMini & Adafruit Pal Transceiver
+// Physical Pin Assignments - ESP32-S3 SuperMini & Adafruit CAN Pal Transceiver
 #define CAN_RX_PIN GPIO_NUM_4
 #define CAN_TX_PIN GPIO_NUM_5
 #define NUM_LEDS 1
 #define DATA_PIN 48
 CRGB leds[NUM_LEDS];
 
-// Cross-Core Concurrency Sync Control Primitive 
+// Dual-Core Execution Data Mux Spinlock Protection
 portMUX_TYPE canDataMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Volatile Multi-Core Synchronized Performance Counters
@@ -37,7 +37,7 @@ volatile bool ignitionOn = false;
 volatile bool inPark = false;
 volatile bool doorOpen = false;
 
-// System Log Handling Parameter Controls
+// Storage Log Configuration Parameters
 const char* logFilePath = "/obd_scan_log.txt";
 volatile bool flashRecordActive = false;
 
@@ -45,22 +45,24 @@ volatile bool flashRecordActive = false;
 char liveTerminalBuffer[4096] = "Initializing Universal Wireless OBD CAN Scanner...\n";
 uint32_t terminalBufferWriteIdx = 51; 
 
-// FreeRTOS Pipeline Handles
+// FreeRTOS Task and Storage Queue handles
 TaskHandle_t CanTaskHandle = NULL;
 TaskHandle_t RgbTaskHandle = NULL;
 TaskHandle_t FlashTaskHandle = NULL;
+TaskHandle_t SavvyTaskHandle = NULL;
 QueueHandle_t flashLogQueue = NULL;
+QueueHandle_t savvyQueue = NULL;
 
-// Data Structure used for streaming packets between Core 0 execution threads safely
+// Intermediate safe storage structure mapped for offloading packets between cores
 struct CanStoragePacket {
     uint32_t id;
     uint8_t dlc;
     uint8_t data[8];
 };
 
-
 // Forward Core Task Declarations
 void canSnifferTask(void *pvParameters);
+void savvyNetworkTask(void *pvParameters);
 void rgbStatusTask(void *pvParameters);
 void flashStorageWriterTask(void *pvParameters);
 void initCAN();
@@ -162,10 +164,15 @@ void setup() {
 
     // Spawn memory tracking allocation pipeline queues
     flashLogQueue = xQueueCreate(64, sizeof(CanStoragePacket));
+    savvyQueue    = xQueueCreate(128, sizeof(CanStoragePacket)); // Generous burst capacity cushion
 
     // Core Tasks Spawning Configuration Blocks
+    // Core 0 handles lightning-fast hardware execution threads
     xTaskCreatePinnedToCore(canSnifferTask, "CAN_Sniffer", 4096, NULL, 5, &CanTaskHandle, 0);
     xTaskCreatePinnedToCore(flashStorageWriterTask, "Flash_Logger", 3072, NULL, 1, &FlashTaskHandle, 0);
+
+    // Core 1 handles network routines alongside the core Arduino Wi-Fi stack
+    xTaskCreatePinnedToCore(savvyNetworkTask, "Savvy_Net", 4096, NULL, 3, &SavvyTaskHandle, 1);
     xTaskCreatePinnedToCore(rgbStatusTask, "RGB_Status", 2048, NULL, 1, &RgbTaskHandle, 1);
 
     // Web Management Interface Endpoints Deployment
@@ -191,48 +198,96 @@ void initCAN() {
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) { twai_start(); }
 }
 
-// Background Interception Tasks Processor (Core 0)
+// TASK 1: High-Speed Vehicle Interception Engine (Core 0 - High Priority)
 void canSnifferTask(void *pvParameters) {
     twai_message_t message;
-    uint8_t txChunkBuffer[512]; // Comfortably buffers up to thirty 18-byte packed blocks
+    for (;;) {
+        if (twai_receive(&message, pdMS_TO_TICKS(2)) == ESP_OK) {
+            portENTER_CRITICAL(&canDataMux);
+            canFrameCount++;
+            lastRawId = message.identifier;
+            snprintf(lastRawData, sizeof(lastRawData), "%02X %02X %02X %02X %02X %02X %02X %02X",
+                     message.data[0], message.data[1], message.data[2], message.data[3],
+                     message.data[4], message.data[5], message.data[6], message.data[7]);
+            
+            if (message.identifier == 0x201) { ignitionOn = (message.data[0] & 0x01); }
+            if (message.identifier == 0x1F1) { inPark     = (message.data[0] == 0x18); }
+            if (message.identifier == 0x216) { doorOpen   = (message.data[0] & 0x40); }
+            portEXIT_CRITICAL(&canDataMux);
+
+            // Print to dashboard browser circular terminal log buffer
+            char tempFrame[80];
+            int size = snprintf(tempFrame, sizeof(tempFrame), "[ID: 0x%X] %s\n", message.identifier, lastRawData);
+            if (size > 0 && size < (int)sizeof(tempFrame)) {
+                portENTER_CRITICAL(&canDataMux);
+                if (terminalBufferWriteIdx + size >= sizeof(liveTerminalBuffer) - 1) { terminalBufferWriteIdx = 0; }
+                memcpy(&liveTerminalBuffer[terminalBufferWriteIdx], tempFrame, size);
+                terminalBufferWriteIdx += size;
+                liveTerminalBuffer[terminalBufferWriteIdx] = '\0';
+                portEXIT_CRITICAL(&canDataMux);
+            }
+
+            // Unpack frame data into standard structure layouts
+            CanStoragePacket currentPacket;
+            currentPacket.id = message.identifier;
+            currentPacket.dlc = message.data_length_code;
+            memcpy(currentPacket.data, message.data, 8);
+
+            // Dispatch frame to local flash logging task queue
+            if (flashRecordActive) {
+                xQueueSend(flashLogQueue, &currentPacket, 0);
+            }
+
+            // Dispatch frame straight to the Wi-Fi transmission queue buffer
+            if (savvyQueue) {
+                xQueueSend(savvyQueue, &currentPacket, 0); 
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+// TASK 2: Isolated Wi-Fi Routing Engine & Protocol Handshake (Core 1)
+void savvyNetworkTask(void *pvParameters) {
+    CanStoragePacket outboundPacket;
+    uint8_t txChunkBuffer[512]; // Blocks network frames to prevent Wi-Fi saturation
     uint16_t txChunkIdx = 0;
     uint32_t lastFlushTime = millis();
-    uint32_t timestampOffset = micros();
 
     for (;;) {
-        // 1. Socket connection monitor
+        // Maintain clean wireless network stream links
         if (!savvyClient || !savvyClient.connected()) {
             savvyClient = savvyServer.accept();
-            txChunkIdx = 0; // Reset buffer indices on a fresh connection setup
+            txChunkIdx = 0;
+            if (savvyQueue) xQueueReset(savvyQueue); // Wipe stale frames on disconnect
         }
 
-        // 2. Intercept Handshake keep-alive commands sent directly from SavvyCAN
+        // Process Handshakes safely without vehicle traffic collisions
         if (savvyClient && savvyClient.connected() && savvyClient.available() > 0) {
             uint8_t cmd = savvyClient.read();
             if (cmd == 0xE7) {
-    uint32_t waitStart = millis();
-    while (savvyClient.available() < 2 && (millis() - waitStart < 30)) { vTaskDelay(1); }
-    if (savvyClient.available() >= 2 && savvyClient.read() == 0xE7 && savvyClient.read() == 0xF1) {
-        // --- PATCH INJECTION MAP ---
-        // Change the 5th byte from 0x01 to 0x02 to declare 2 active hardware buses (Bus 0 and Bus 1)
-        uint8_t initReply[] = {0xE7, 0xE7, 0xF1, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00};
-        savvyClient.write(initReply, 10);
-    }
-}
+                uint32_t waitStart = millis();
+                while (savvyClient.available() < 2 && (millis() - waitStart < 30)) { vTaskDelay(1); }
+                if (savvyClient.available() >= 2 && savvyClient.read() == 0xE7 && savvyClient.read() == 0xF1) {
+                    // --- GVRET-V2 CONFIGURATION INJECTION PATCH ---
+                    // 4th Byte changed from 0x01 to 0x02 to declare microsecond V2 alignment profiles
+                    uint8_t initReply[] = {0xE7, 0xE7, 0xF1, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00}; 
+                    savvyClient.write(initReply, 10);
+                }
+            }
             else if (cmd == 0xF1) {
                 uint32_t waitStart = millis();
                 while (savvyClient.available() < 1 && (millis() - waitStart < 30)) { vTaskDelay(1); }
                 if (savvyClient.available() >= 1) {
                     uint8_t subCmd = savvyClient.read();
-                    if (subCmd == 0x09) { // SavvyCAN Heartbeat Ping
+                    if (subCmd == 0x09) {
                         uint8_t reply[] = {0xF1, 0x09, 0xDE, 0xAD};
                         savvyClient.write(reply, 4);
                     } 
-                    else if (subCmd == 0x0D) { // Bus options configuration query
+                    else if (subCmd == 0x0D) {
                         uint8_t extReply[] = {0xF1, 0x0D, 0x00, 0x07, 0xA1, 0x20}; 
                         savvyClient.write(extReply, 6);
                     }
-                    else if (subCmd == 0x01) { // Speed Sync Override Handler
+                    else if (subCmd == 0x01) {
                         uint32_t speedWait = millis();
                         while(savvyClient.available() < 5 && (millis() - speedWait < 50)) { vTaskDelay(1); }
                         if (savvyClient.available() >= 5) {
@@ -247,78 +302,43 @@ void canSnifferTask(void *pvParameters) {
             }
         }
 
-        // 3. Sniff physical vehicle lines out of the underlying transceiver
-        if (twai_receive(&message, pdMS_TO_TICKS(2)) == ESP_OK) {
-            portENTER_CRITICAL(&canDataMux);
-            canFrameCount++;
-            lastRawId = message.identifier;
-            snprintf(lastRawData, sizeof(lastRawData), "%02X %02X %02X %02X %02X %02X %02X %02X",
-                     message.data[0], message.data[1], message.data[2], message.data[3],
-                     message.data[4], message.data[5], message.data[6], message.data[7]);
-            
-            if (message.identifier == 0x201) { ignitionOn = (message.data[0] & 0x01); }
-            if (message.identifier == 0x1F1) { inPark     = (message.data[0] == 0x18); }
-            if (message.identifier == 0x216) { doorOpen   = (message.data[0] & 0x40); }
-            portEXIT_CRITICAL(&canDataMux);
-
-            // Print entries out cleanly into local web dashboards RAM memory allocations
-            char tempFrame[80];
-            int size = snprintf(tempFrame, sizeof(tempFrame), "[ID: 0x%X] %s\n", message.identifier, lastRawData);
-            if (size > 0 && size < (int)sizeof(tempFrame)) {
-                portENTER_CRITICAL(&canDataMux);
-                if (terminalBufferWriteIdx + size >= sizeof(liveTerminalBuffer) - 1) { terminalBufferWriteIdx = 0; }
-                memcpy(&liveTerminalBuffer[terminalBufferWriteIdx], tempFrame, size);
-                terminalBufferWriteIdx += size;
-                liveTerminalBuffer[terminalBufferWriteIdx] = '\0';
-                portEXIT_CRITICAL(&canDataMux);
-            }
-
-            if (flashRecordActive) {
-                CanStoragePacket storageFrame;
-                storageFrame.id = message.identifier;
-                storageFrame.dlc = message.data_length_code;
-                memcpy(storageFrame.data, message.data, 8);
-                xQueueSend(flashLogQueue, &storageFrame, 0);
-            }
-
-            // 4. Encode data frames directly using strict sequential indices (Padding-Immune Patch)
-            if (savvyClient && savvyClient.connected()) {
+        // Pull frames out of our thread-safe memory queue and package them
+        if (savvyClient && savvyClient.connected() && savvyQueue) {
+            while (xQueueReceive(savvyQueue, &outboundPacket, 0) == pdTRUE) {
                 if (txChunkIdx + 18 <= sizeof(txChunkBuffer)) {
-                    uint32_t now = micros() - timestampOffset;
+                    uint32_t now = micros();
                     
-                    // Format CAN frame ID maps, encoding extended headers explicitly if needed
-                    uint32_t cleanId = message.identifier;
-                    if (message.extd) cleanId |= 1U << 31;
-
-                    // Write 18 bytes into sequential memory positions to bypass CPU packing structures
-                    txChunkBuffer[txChunkIdx]      = 0xF1;                       // Command key token slot
+                    txChunkBuffer[txChunkIdx]      = 0xF1; // Data identifier token
                     
-                    // Timestamps mappings indices (4 Bytes, Little Endian)
+                    // Enforce strict unvarying Little-Endian timestamps layout configurations
                     txChunkBuffer[txChunkIdx + 1]  = (now & 0xFF);
                     txChunkBuffer[txChunkIdx + 2]  = ((now >> 8) & 0xFF);
                     txChunkBuffer[txChunkIdx + 3]  = ((now >> 16) & 0xFF);
                     txChunkBuffer[txChunkIdx + 4]  = ((now >> 24) & 0xFF);
 
-                    // CAN Identifiers maps indices (4 Bytes, Little Endian)
-                    txChunkBuffer[txChunkIdx + 5]  = (cleanId & 0xFF);
-                    txChunkBuffer[txChunkIdx + 6]  = ((cleanId >> 8) & 0xFF);
-                    txChunkBuffer[txChunkIdx + 7]  = ((cleanId >> 16) & 0xFF);
-                    txChunkBuffer[txChunkIdx + 8]  = ((cleanId >> 24) & 0xFF);
+                    // Frame ID formatting matrix parameters
+                    txChunkBuffer[txChunkIdx + 5]  = (outboundPacket.id & 0xFF);
+                    txChunkBuffer[txChunkIdx + 6]  = ((outboundPacket.id >> 8) & 0xFF);
+                    txChunkBuffer[txChunkIdx + 7]  = ((outboundPacket.id >> 16) & 0xFF);
+                    txChunkBuffer[txChunkIdx + 8]  = ((outboundPacket.id >> 24) & 0xFF);
 
-                    // Hard mask parameters: Upper 4 bits (Bus ID = 0), Lower 4 bits (DLC size)
-                    txChunkBuffer[txChunkIdx + 9]  = (message.data_length_code & 0x0F);
+                    // Force upper 4 bits to 0 to keep the bus index strictly locked on Bus 0
+                    txChunkBuffer[txChunkIdx + 9]  = (outboundPacket.dlc & 0x0F);
 
-                    // Payload block distribution array mapping loops
+                    // Payload bytes copying mapping loop
                     for (int i = 0; i < 8; i++) {
-                        txChunkBuffer[txChunkIdx + 10 + i] = (i < message.data_length_code) ? message.data[i] : 0x00;
+                        txChunkBuffer[txChunkIdx + 10 + i] = (i < outboundPacket.dlc) ? outboundPacket.data[i] : 0x00;
                     }
 
-                    txChunkIdx += 18; // Step forward tracking index location cursor
+                    txChunkIdx += 18;
                 }
+                
+                // Break early if our transmission block buffer gets full
+                if (txChunkIdx >= sizeof(txChunkBuffer) - 18) break;
             }
         }
 
-        // 5. Flushes data chunks out over Wi-Fi every 10ms to prevent lag or memory drops
+        // Flush our data chunks over the air every 10ms
         if (savvyClient && savvyClient.connected() && txChunkIdx > 0) {
             if (txChunkIdx >= sizeof(txChunkBuffer) - 18 || (millis() - lastFlushTime >= 10)) {
                 savvyClient.write(txChunkBuffer, txChunkIdx);
@@ -330,8 +350,7 @@ void canSnifferTask(void *pvParameters) {
     }
 }
 
-
-// Non-blocking offloaded flash logging thread (Core 0 - Low Priority)
+// Low-Priority Flash writer offload task loops
 void flashStorageWriterTask(void *pvParameters) {
     CanStoragePacket currentPacket;
     for (;;) {
@@ -374,7 +393,6 @@ void rgbStatusTask(void *pvParameters) {
     }
 }
 void handleRoot() {
-    // Send structural layout assets split across multiple chunks to optimize heap safety limits
     server.setContentLength(strlen(htmlDashboard) + strlen(htmlDashboard_part2));
     server.send(200, "text/html", "");
     server.sendContent(htmlDashboard);
@@ -395,14 +413,12 @@ void handleTelemetryJson() {
 
     snprintf(jsonStackBuffer, sizeof(jsonStackBuffer),
              "{\"v\":%.1f,\"r\":%d,\"t\":%d,\"id\":%lu,\"fc\":%lu,\"isRec\":%s}",
-             outputVolts, outputRpm, outputTemp, currentId, currentCount,
+             outputVolts, outputRpm, outputTemp, (unsigned long)currentId, (unsigned long)currentCount,
              flashRecordActive ? "true" : "false");
     server.send(200, "application/json", jsonStackBuffer);
 }
 
-void handleLiveText() { 
-    server.send(200, "text/plain", liveTerminalBuffer); 
-}
+void handleLiveText() { server.send(200, "text/plain", liveTerminalBuffer); }
 
 void handleToggleRecord() {
     flashRecordActive = !flashRecordActive;
